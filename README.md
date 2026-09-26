@@ -11,6 +11,22 @@ Your support helps others discover the project and encourages further developmen
 > source disks read-only, but it is not a full filesystem integrity checker or a
 > guaranteed data-recovery solution. See the limitations below before extracting.
 
+## Download
+
+**No Rust installation or compilation is required to use the prebuilt Windows x64 application.**
+
+- [Browse GitHub Releases](https://github.com/hainv-dev/APFS-explorer-for-windows/releases)
+- [Download v0.1.0 Windows x64 ZIP (recommended)](https://github.com/hainv-dev/APFS-explorer-for-windows/releases/download/v0.1.0/APFS-Explorer-v0.1.0-windows-x64.zip)
+- [Download v0.1.0 executable](https://github.com/hainv-dev/APFS-explorer-for-windows/releases/download/v0.1.0/apfs_explorer.exe)
+
+1. Download and extract the ZIP to a local folder.
+2. Run `apfs_explorer.exe`. Use **Run as administrator** if physical-disk access is denied.
+3. Select **Scan drives**, then **Browse volumes** on a verified APFS partition.
+
+Version 0.1.0 is a **pre-release**. The executable is unsigned, so Windows may
+display a security warning. Download only from this repository's Releases page;
+SHA256 checksums are included in the release notes.
+
 ## Features
 
 - Scan connected Windows disks for APFS GPT partitions and verify NXSB signatures.
