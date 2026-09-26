@@ -1,0 +1,18 @@
+[package]
+name = "apfs_explorer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "wgpu"] }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+apfs-core = "=0.2.6"
+tempfile = "3"
+open = "5"
+egui_extras = { version = "0.31", features = ["svg"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
+[target.'cfg(windows)'.dependencies]
+wgpu = { version = "24", default-features = false, features = ["dx12"] }
