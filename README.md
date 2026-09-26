@@ -1,5 +1,7 @@
 # APFS Explorer
 
+<p align="center"><img src="icon.png" alt="APFS Explorer icon" width="160"></p>
+
 A read-only APFS browser for Windows, built with Rust and egui/eframe.
 Discover connected Apple File System partitions, browse unencrypted volumes,
 and extract files or folders without installing an APFS filesystem driver.
@@ -16,14 +18,16 @@ Your support helps others discover the project and encourages further developmen
 **No Rust installation or compilation is required to use the prebuilt Windows x64 application.**
 
 - [Browse GitHub Releases](https://github.com/hainv-dev/APFS-explorer-for-windows/releases)
-- [Download v0.1.0 Windows x64 ZIP (recommended)](https://github.com/hainv-dev/APFS-explorer-for-windows/releases/download/v0.1.0/APFS-Explorer-v0.1.0-windows-x64.zip)
-- [Download v0.1.0 executable](https://github.com/hainv-dev/APFS-explorer-for-windows/releases/download/v0.1.0/apfs_explorer.exe)
+- [Download v0.1.1 Windows x64 ZIP (recommended)](https://github.com/hainv-dev/APFS-explorer-for-windows/releases/download/v0.1.1/APFS-Explorer-v0.1.1-windows-x64.zip)
+- [Download v0.1.1 executable](https://github.com/hainv-dev/APFS-explorer-for-windows/releases/download/v0.1.1/apfs_explorer.exe)
 
 1. Download and extract the ZIP to a local folder.
 2. Run `apfs_explorer.exe`. Use **Run as administrator** if physical-disk access is denied.
 3. Select **Scan drives**, then **Browse volumes** on a verified APFS partition.
 
-Version 0.1.0 is a **pre-release**. The executable is unsigned, so Windows may
+Version 0.1.1 is a **pre-release** and includes the new application icon in the
+window and Windows executable, with icon sizes from 16 to 256 pixels.
+The executable is unsigned, so Windows may
 display a security warning. Download only from this repository's Releases page;
 SHA256 checksums are included in the release notes.
 

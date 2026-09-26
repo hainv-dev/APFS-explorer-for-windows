@@ -536,6 +536,7 @@ fn main() -> eframe::Result<()> {
         eframe::NativeOptions {
             renderer: eframe::Renderer::Wgpu,
             viewport: egui::ViewportBuilder::default()
+                .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../icon.png")).expect("Invalid application icon"))
                 .with_inner_size([1180.0, 760.0])
                 .with_min_inner_size([700.0, 480.0]),
             ..Default::default()

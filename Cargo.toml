@@ -1,6 +1,6 @@
 [package]
 name = "apfs_explorer"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
@@ -16,3 +16,7 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [target.'cfg(windows)'.dependencies]
 wgpu = { version = "24", default-features = false, features = ["dx12"] }
+
+[build-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+winresource = "0.1"
