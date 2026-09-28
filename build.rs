@@ -9,16 +9,36 @@ fn main() {
     let frames: Vec<_> = [16, 24, 32, 48, 64, 128, 256]
         .into_iter()
         .map(|size| {
-            let pixels = source.resize_exact(size, size, image::imageops::FilterType::Lanczos3).to_rgba8();
-            image::codecs::ico::IcoFrame::as_png(&pixels, size, size, image::ExtendedColorType::Rgba8)
-                .expect("Cannot encode icon frame")
+            let pixels = source
+                .resize_exact(size, size, image::imageops::FilterType::Lanczos3)
+                .to_rgba8();
+            image::codecs::ico::IcoFrame::as_png(
+                &pixels,
+                size,
+                size,
+                image::ExtendedColorType::Rgba8,
+            )
+            .expect("Cannot encode icon frame")
         })
         .collect();
     image::codecs::ico::IcoEncoder::new(std::fs::File::create(&icon).expect("Cannot create ICO"))
-        .encode_images(&frames).expect("Cannot encode ICO");
+        .encode_images(&frames)
+        .expect("Cannot encode ICO");
     winresource::WindowsResource::new()
         .set_icon(icon.to_str().expect("Invalid icon path"))
         .set("ProductName", "APFS Explorer")
         .set("FileDescription", "APFS Explorer for Windows")
-        .compile().expect("Cannot compile Windows icon resource");
+        .set_manifest(
+            r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+    <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+        <security>
+            <requestedPrivileges>
+                <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+            </requestedPrivileges>
+        </security>
+    </trustInfo>
+</assembly>"#,
+        )
+        .compile()
+        .expect("Cannot compile Windows icon resource");
 }

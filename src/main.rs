@@ -129,7 +129,7 @@ impl Explorer {
                             .inner_margin(16)
                             .corner_radius(6)
                             .stroke(egui::Stroke::new(
-                                1.0,
+                                1.0_f32,
                                 egui::Color32::from_rgb(225, 230, 236),
                             ))
                             .show(ui, |ui| {
@@ -536,7 +536,10 @@ fn main() -> eframe::Result<()> {
         eframe::NativeOptions {
             renderer: eframe::Renderer::Wgpu,
             viewport: egui::ViewportBuilder::default()
-                .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../icon.png")).expect("Invalid application icon"))
+                .with_icon(
+                    eframe::icon_data::from_png_bytes(include_bytes!("../icon.png"))
+                        .expect("Invalid application icon"),
+                )
                 .with_inner_size([1180.0, 760.0])
                 .with_min_inner_size([700.0, 480.0]),
             ..Default::default()
@@ -569,15 +572,15 @@ fn main() -> eframe::Result<()> {
                 style.visuals.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
                 style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
                 style.visuals.widgets.inactive.fg_stroke =
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(46, 51, 58));
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(46, 51, 58));
                 style.visuals.widgets.noninteractive.bg_stroke =
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(226, 230, 235));
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(226, 230, 235));
                 style.visuals.faint_bg_color = egui::Color32::from_rgb(248, 250, 252);
                 style.visuals.extreme_bg_color = egui::Color32::WHITE;
                 style.visuals.panel_fill = egui::Color32::from_rgb(249, 250, 252);
                 style.visuals.selection.bg_fill = egui::Color32::from_rgb(213, 234, 252);
                 style.visuals.selection.stroke =
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(24, 92, 148));
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(24, 92, 148));
                 style.visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(232, 239, 246);
             });
             Ok(Box::<Explorer>::default())

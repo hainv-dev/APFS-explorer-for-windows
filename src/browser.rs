@@ -7,21 +7,30 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub struct Transfer {
     pub completed: AtomicU64,
     pub total: AtomicU64,
+    pub started: std::sync::Mutex<Option<std::time::Instant>>,
     pub cancelled: AtomicBool,
     pub conflicts: Option<std::sync::mpsc::Sender<ConflictRequest>>,
     pub skipped: AtomicU64,
+    pub files_total: AtomicU64,
+    pub files_handled: AtomicU64,
+    pub files_counted: AtomicBool,
+    pub folder_started: std::sync::Mutex<Option<std::time::Instant>>,
     policies: std::sync::Mutex<[Option<bool>; 2]>,
+    normalize_all: AtomicBool,
 }
 
 pub struct ConflictRequest {
     pub path: std::path::PathBuf,
     pub directory: bool,
+    pub invalid_name: Option<String>,
     pub reply: std::sync::mpsc::Sender<ConflictAnswer>,
 }
 
 pub struct ConflictAnswer {
     pub proceed: Option<bool>,
     pub apply_all: bool,
+    pub rename: Option<String>,
+    pub auto_normalize: bool,
 }
 
 impl Transfer {
@@ -93,7 +102,7 @@ impl<R: Read + Seek> Seek for PartitionReader<R> {
     }
 }
 
-fn windows_component(name: &str) -> Result<String, String> {
+pub(crate) fn windows_component(name: &str) -> Result<String, String> {
     if name.is_empty() || name == "." || name == ".." {
         return Err("Invalid directory entry name".into());
     }
@@ -138,11 +147,11 @@ fn windows_component(name: &str) -> Result<String, String> {
     Ok(output)
 }
 
-fn exact_component(name: &str) -> Result<String, String> {
+pub(crate) fn exact_component(name: &str) -> Result<String, String> {
     let normalized = windows_component(name)?;
     if normalized != name {
         return Err(format!(
-            "Cannot preserve this name on Windows: {name:?}. Choose another destination filesystem or rename the source explicitly."
+            "Cannot preserve this name on Windows: {name:?}. Choose a Windows-safe name or skip this entry."
         ));
     }
     Ok(normalized)
@@ -193,6 +202,7 @@ fn conflict_choice(
         .send(ConflictRequest {
             path: path.to_path_buf(),
             directory,
+            invalid_name: None,
             reply,
         })
         .map_err(|_| "Conflict UI closed")?;
@@ -212,6 +222,64 @@ fn conflict_choice(
                 }
                 transfer.check()?;
                 return Ok(choice);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => return Err("Conflict UI closed; extraction stopped.".into()),
+        }
+    }
+}
+
+fn choose_component(
+    name: &str,
+    parent: &std::path::Path,
+    directory: bool,
+    transfer: &Transfer,
+) -> Result<Option<String>, String> {
+    transfer.check()?;
+    if let Ok(component) = exact_component(name) {
+        return Ok(Some(component));
+    }
+    if transfer.normalize_all.load(Ordering::Relaxed) {
+        if let Ok(component) = windows_component(name) {
+            return Ok(Some(component));
+        }
+    }
+    let (reply, receiver) = std::sync::mpsc::channel();
+    transfer
+        .conflicts
+        .as_ref()
+        .ok_or("Invalid filename requires a UI decision")?
+        .send(ConflictRequest {
+            path: parent.to_path_buf(),
+            directory,
+            invalid_name: Some(name.to_owned()),
+            reply,
+        })
+        .map_err(|_| "Conflict UI closed")?;
+    loop {
+        transfer.check()?;
+        match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(answer) => {
+                transfer.check()?;
+                match answer.proceed {
+                    Some(true) => {
+                        if answer.auto_normalize {
+                            let component = windows_component(name)?;
+                            if answer.apply_all {
+                                transfer.normalize_all.store(true, Ordering::Relaxed);
+                            }
+                            return Ok(Some(component));
+                        }
+                        return exact_component(answer.rename.as_deref().unwrap_or("")).map(Some);
+                    }
+                    Some(false) => return Ok(None),
+                    None => {
+                        transfer.cancelled.store(true, Ordering::Relaxed);
+                        return Err(
+                            "Extraction cancelled. Previously copied files were kept.".into()
+                        );
+                    }
+                }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(_) => return Err("Conflict UI closed; extraction stopped.".into()),
@@ -257,9 +325,122 @@ pub struct Browser {
     reader: PartitionReader<File>,
     pub volumes: Vec<Volume>,
     block_size: usize,
+    partition: crate::drives::Partition,
+}
+
+fn unsupported_entry(flags: u64) -> bool {
+    !matches!(flags & 15, 4 | 8)
+}
+
+#[derive(Default)]
+struct FolderScan {
+    counts: std::collections::HashMap<u64, u64>,
+    result: Option<Result<(), String>>,
+    waiting_for_count: bool,
+}
+
+fn wait_for_folder_count(
+    scan: &std::sync::Condvar,
+    state: &std::sync::Mutex<FolderScan>,
+    oid: u64,
+    transfer: &Transfer,
+) -> Result<u64, String> {
+    let mut state = state.lock().map_err(|_| "Folder scan unavailable")?;
+    state.waiting_for_count = true;
+    scan.notify_all();
+    loop {
+        if let Err(error) = transfer.check() {
+            state.waiting_for_count = false;
+            return Err(error);
+        }
+        if let Some(Err(error)) = &state.result {
+            let error = error.clone();
+            state.waiting_for_count = false;
+            return Err(error);
+        }
+        if let Some(&count) = state.counts.get(&oid) {
+            state.waiting_for_count = false;
+            return Ok(count);
+        }
+        if state.result.is_some() {
+            state.waiting_for_count = false;
+            return Err("Folder was not counted".into());
+        }
+        state = scan
+            .wait_timeout(state, std::time::Duration::from_millis(100))
+            .map_err(|_| "Folder scan unavailable")?
+            .0;
+    }
 }
 
 impl Browser {
+    fn count_folder_files(
+        &mut self,
+        volume: usize,
+        root: u64,
+        transfer: &Transfer,
+        shared: &(std::sync::Mutex<FolderScan>, std::sync::Condvar),
+        stop: &AtomicBool,
+    ) -> Result<(), String> {
+        let mut visited = std::collections::HashSet::new();
+        let mut stack = vec![(root, 0_usize, None)];
+        while let Some((directory, depth, children)) = stack.pop() {
+            transfer.check()?;
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let mut state = shared.0.lock().map_err(|_| "Folder scan unavailable")?;
+            while !state.waiting_for_count
+                && transfer
+                    .files_total
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(transfer.files_handled.load(Ordering::Relaxed))
+                    >= 4096
+            {
+                transfer.check()?;
+                if stop.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                state = shared
+                    .1
+                    .wait_timeout(state, std::time::Duration::from_millis(100))
+                    .map_err(|_| "Folder scan unavailable")?
+                    .0;
+            }
+            drop(state);
+            if let Some((mut count, children)) = children {
+                let mut state = shared.0.lock().map_err(|_| "Folder scan unavailable")?;
+                for child in children {
+                    count += state.counts[&child];
+                }
+                state.counts.insert(directory, count);
+                shared.1.notify_all();
+            } else {
+                if depth > 64 || !visited.insert(directory) {
+                    return Err("Directory cycle or depth limit reached.".into());
+                }
+                let mut children = Vec::new();
+                let mut direct_files = 0;
+                for entry in self.list(volume, directory)? {
+                    match entry.flags & 15 {
+                        4 => children.push(entry.file_id),
+                        8 => direct_files += 1,
+                        _ => {}
+                    }
+                }
+                transfer
+                    .files_total
+                    .fetch_add(direct_files, Ordering::Relaxed);
+                shared.1.notify_all();
+                stack.push((directory, depth, Some((direct_files, children.clone()))));
+                for child in children {
+                    stack.push((child, depth + 1, None));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn extract_folder(
         &mut self,
         volume: usize,
@@ -267,80 +448,171 @@ impl Browser {
         name: &str,
         parent: &std::path::Path,
         transfer: &Transfer,
-    ) -> Result<std::path::PathBuf, String> {
+    ) -> Result<Option<std::path::PathBuf>, String> {
         transfer.check()?;
-        let destination = parent.join(exact_component(name)?);
+        let Some(component) = choose_component(name, parent, true, transfer)? else {
+            transfer.skipped.store(1, Ordering::Relaxed);
+            return Ok(None);
+        };
+        let destination = parent.join(component);
         if !prepare_directory(&destination, transfer)? {
-            return Err("Folder skipped by user.".into());
+            transfer.skipped.store(1, Ordering::Relaxed);
+            return Ok(None);
         }
-        let mut stack = vec![(oid, destination.clone(), 0_usize)];
-        let mut skipped = 0_u64;
-        let mut visited = std::collections::HashSet::new();
-        while let Some((directory, destination, depth)) = stack.pop() {
-            transfer.check()?;
-            if depth > 64 || !visited.insert(directory) {
-                return Err("Directory cycle or depth limit reached.".into());
-            }
-            transfer.completed.store(0, Ordering::Relaxed);
-            transfer.total.store(0, Ordering::Relaxed);
-            let entries = self.list(volume, directory)?;
-            let mut names = std::collections::HashSet::new();
-            for entry in entries {
-                transfer.check()?;
-                let component = exact_component(&entry.name)?;
-                if !names.insert(component.to_uppercase()) {
-                    return Err(format!("Windows filename collision: {}", entry.name));
+        *transfer.folder_started.lock().unwrap() = Some(std::time::Instant::now());
+        let mut scanner = Browser::open(&self.partition)?;
+        let shared = (
+            std::sync::Mutex::new(FolderScan::default()),
+            std::sync::Condvar::new(),
+        );
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let result = scanner.count_folder_files(volume, oid, transfer, &shared, &stop);
+                let mut state = shared.0.lock().unwrap();
+                if result.is_ok() && !stop.load(Ordering::Relaxed) {
+                    transfer.files_counted.store(true, Ordering::Relaxed);
                 }
-                let path = destination.join(component);
-                match entry.flags & 15 {
-                    4 => {
-                        if prepare_directory(&path, transfer)? {
-                            stack.push((entry.file_id, path, depth + 1));
-                        } else {
+                state.result = Some(result);
+                shared.1.notify_all();
+            });
+            let result = (|| {
+                let mut state = shared.0.lock().map_err(|_| "Folder scan unavailable")?;
+                while transfer.files_total.load(Ordering::Relaxed) < 1000 && state.result.is_none()
+                {
+                    transfer.check()?;
+                    state = shared
+                        .1
+                        .wait_timeout(state, std::time::Duration::from_millis(100))
+                        .map_err(|_| "Folder scan unavailable")?
+                        .0;
+                }
+                if let Some(Err(error)) = &state.result {
+                    return Err(error.clone());
+                }
+                drop(state);
+                *transfer.folder_started.lock().unwrap() = Some(std::time::Instant::now());
+                let mut stack = vec![(oid, destination.clone(), 0_usize)];
+                let mut skipped = 0_u64;
+                let mut visited = std::collections::HashSet::new();
+                while let Some((directory, destination, depth)) = stack.pop() {
+                    transfer.check()?;
+                    if depth > 64 || !visited.insert(directory) {
+                        return Err("Directory cycle or depth limit reached.".into());
+                    }
+                    transfer.completed.store(0, Ordering::Relaxed);
+                    transfer.total.store(0, Ordering::Relaxed);
+                    let entries = self.list(volume, directory)?;
+                    let mut names = std::collections::HashSet::new();
+                    for entry in entries {
+                        transfer.check()?;
+                        if unsupported_entry(u64::from(entry.flags)) {
                             skipped += 1;
+                            continue;
                         }
-                    }
-                    8 => {
-                        if let Some(metadata) = destination_metadata(&path)? {
-                            if !metadata.is_file() {
-                                return Err(format!(
-                                    "Destination is not a regular file: {}",
-                                    path.display()
-                                ));
+                        let Some(component) = choose_component(
+                            &entry.name,
+                            &destination,
+                            entry.flags & 15 == 4,
+                            transfer,
+                        )?
+                        else {
+                            skipped += 1;
+                            transfer.files_handled.fetch_add(
+                                if entry.flags & 15 == 4 {
+                                    wait_for_folder_count(
+                                        &shared.1,
+                                        &shared.0,
+                                        entry.file_id,
+                                        transfer,
+                                    )?
+                                } else {
+                                    u64::from(entry.flags & 15 == 8)
+                                },
+                                Ordering::Relaxed,
+                            );
+                            continue;
+                        };
+                        if !names.insert(component.to_uppercase()) {
+                            return Err(format!("Windows filename collision: {}", entry.name));
+                        }
+                        let path = destination.join(component);
+                        match entry.flags & 15 {
+                            4 => {
+                                if prepare_directory(&path, transfer)? {
+                                    stack.push((entry.file_id, path, depth + 1));
+                                } else {
+                                    skipped += 1;
+                                    transfer.files_handled.fetch_add(
+                                        wait_for_folder_count(
+                                            &shared.1,
+                                            &shared.0,
+                                            entry.file_id,
+                                            transfer,
+                                        )?,
+                                        Ordering::Relaxed,
+                                    );
+                                }
                             }
-                            if !conflict_choice(&path, false, transfer)? {
-                                skipped += 1;
-                                continue;
-                            }
-                            let staging =
-                                tempfile::tempdir_in(path.parent().ok_or("Missing parent")?)
+                            8 => {
+                                if let Some(metadata) = destination_metadata(&path)? {
+                                    if !metadata.is_file() {
+                                        return Err(format!(
+                                            "Destination is not a regular file: {}",
+                                            path.display()
+                                        ));
+                                    }
+                                    if !conflict_choice(&path, false, transfer)? {
+                                        skipped += 1;
+                                        transfer.files_handled.fetch_add(1, Ordering::Relaxed);
+                                        continue;
+                                    }
+                                    let staging = tempfile::tempdir_in(
+                                        path.parent().ok_or("Missing parent")?,
+                                    )
                                     .map_err(|error| error.to_string())?;
-                            let staged = staging.path().join("content");
-                            self.extract_stream(volume, entry.file_id, &staged, transfer, None)?;
-                            transfer.check()?;
-                            if destination_metadata(&path)?
-                                .is_some_and(|metadata| !metadata.is_file())
-                            {
-                                return Err("Destination changed type during extraction.".into());
+                                    let staged = staging.path().join("content");
+                                    self.extract_stream(
+                                        volume,
+                                        entry.file_id,
+                                        &staged,
+                                        transfer,
+                                        None,
+                                    )?;
+                                    transfer.check()?;
+                                    if destination_metadata(&path)?
+                                        .is_some_and(|metadata| !metadata.is_file())
+                                    {
+                                        return Err(
+                                            "Destination changed type during extraction.".into()
+                                        );
+                                    }
+                                    std::fs::rename(&staged, &path)
+                                        .map_err(|error| error.to_string())?;
+                                } else {
+                                    self.extract_stream(
+                                        volume,
+                                        entry.file_id,
+                                        &path,
+                                        transfer,
+                                        None,
+                                    )
+                                    .map_err(|error| format!("{}: {error}", entry.name))?;
+                                }
+                                transfer.files_handled.fetch_add(1, Ordering::Relaxed);
                             }
-                            std::fs::rename(&staged, &path).map_err(|error| error.to_string())?;
-                        } else {
-                            self.extract_stream(volume, entry.file_id, &path, transfer, None)
-                                .map_err(|error| format!("{}: {error}", entry.name))?;
+                            _ => unreachable!(),
                         }
-                    }
-                    _ => {
-                        return Err(format!(
-                            "Unsupported entry (symlink or special file): {}",
-                            entry.name
-                        ));
                     }
                 }
-            }
-        }
-        transfer.check()?;
-        transfer.skipped.store(skipped, Ordering::Relaxed);
-        Ok(destination)
+                transfer.check()?;
+                let _ = wait_for_folder_count(&shared.1, &shared.0, oid, transfer)?;
+                transfer.skipped.store(skipped, Ordering::Relaxed);
+                Ok(Some(destination))
+            })();
+            stop.store(true, Ordering::Relaxed);
+            result
+        })
     }
 
     pub fn file_sizes(
@@ -529,6 +801,7 @@ impl Browser {
             reader,
             volumes,
             block_size,
+            partition: partition.clone(),
         })
     }
 
@@ -563,6 +836,7 @@ fn stream_to_new_file(
     if destination.exists() {
         return Err("Destination already exists; no files overwritten.".into());
     }
+    *transfer.started.lock().unwrap() = Some(std::time::Instant::now());
     transfer.total.store(size, Ordering::Relaxed);
     transfer.completed.store(0, Ordering::Relaxed);
     transfer.check()?;
@@ -665,6 +939,39 @@ fn save_new_file(destination: &std::path::Path, bytes: &[u8]) -> Result<(), Stri
 mod tests {
     use super::*;
     #[test]
+    fn folder_extraction_skips_special_entry_types() {
+        assert!(!unsupported_entry(4));
+        assert!(!unsupported_entry(8));
+        assert!(unsupported_entry(10));
+        assert!(unsupported_entry(2));
+        assert!(unsupported_entry(0));
+        assert!(unsupported_entry(0x1a));
+    }
+    #[test]
+    fn folder_scanner_publishes_counts_and_errors() {
+        let shared = (
+            std::sync::Mutex::new(FolderScan::default()),
+            std::sync::Condvar::new(),
+        );
+        let transfer = Transfer::default();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut state = shared.0.lock().unwrap();
+                state.counts.insert(5, 12);
+                shared.1.notify_all();
+            });
+            assert_eq!(
+                wait_for_folder_count(&shared.1, &shared.0, 5, &transfer).unwrap(),
+                12
+            );
+        });
+        shared.0.lock().unwrap().result = Some(Err("Scan failed".into()));
+        assert_eq!(
+            wait_for_folder_count(&shared.1, &shared.0, 6, &transfer).unwrap_err(),
+            "Scan failed"
+        );
+    }
+    #[test]
     fn missing_stream_requires_empty_uncompressed_local_file() {
         assert_eq!(resolve_file_size(None, 0, false).unwrap(), 0);
         assert!(resolve_file_size(None, 0, true).is_err());
@@ -689,6 +996,8 @@ mod tests {
                     .send(ConflictAnswer {
                         proceed: Some(true),
                         apply_all: true,
+                        rename: None,
+                        auto_normalize: false,
                     })
                     .unwrap();
                 let request = receiver.recv().unwrap();
@@ -698,6 +1007,8 @@ mod tests {
                     .send(ConflictAnswer {
                         proceed: Some(false),
                         apply_all: true,
+                        rename: None,
+                        auto_normalize: false,
                     })
                     .unwrap();
             });
@@ -722,6 +1033,145 @@ mod tests {
         assert!(prepare_directory(&target, &Transfer::default()).unwrap());
         assert!(target.is_dir());
         assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
+    }
+    #[test]
+    fn invalid_names_can_be_renamed_or_skipped() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let transfer = Transfer::with_conflicts(sender);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                for (name, decision) in [
+                    ("bad:name", (Some(true), Some("good_name"))),
+                    ("bad:name", (Some(false), None)),
+                    ("bad:name", (Some(true), Some("still:bad"))),
+                ] {
+                    let request = receiver.recv().unwrap();
+                    assert_eq!(request.invalid_name.as_deref(), Some(name));
+                    request
+                        .reply
+                        .send(ConflictAnswer {
+                            proceed: decision.0,
+                            apply_all: false,
+                            rename: decision.1.map(str::to_owned),
+                            auto_normalize: false,
+                        })
+                        .unwrap();
+                }
+            });
+            let parent = std::path::Path::new("parent");
+            assert_eq!(
+                choose_component("bad:name", parent, false, &transfer).unwrap(),
+                Some("good_name".into())
+            );
+            assert_eq!(
+                choose_component("bad:name", parent, false, &transfer).unwrap(),
+                None
+            );
+            assert!(choose_component("bad:name", parent, false, &transfer).is_err());
+        });
+    }
+    #[test]
+    fn auto_normalize_is_scoped_to_one_extraction() {
+        let parent = std::path::Path::new("parent");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let transfer = Transfer::with_conflicts(sender);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let request = receiver.recv().unwrap();
+                assert_eq!(request.invalid_name.as_deref(), Some("a:b.txt"));
+                request
+                    .reply
+                    .send(ConflictAnswer {
+                        proceed: Some(true),
+                        apply_all: true,
+                        rename: None,
+                        auto_normalize: true,
+                    })
+                    .unwrap();
+                let request = receiver.recv().unwrap();
+                assert_eq!(request.invalid_name.as_deref(), Some("..."));
+                request
+                    .reply
+                    .send(ConflictAnswer {
+                        proceed: Some(false),
+                        apply_all: false,
+                        rename: None,
+                        auto_normalize: false,
+                    })
+                    .unwrap();
+            });
+            assert_eq!(
+                choose_component("a:b.txt", parent, false, &transfer).unwrap(),
+                Some("a_b.txt".into())
+            );
+            assert_eq!(
+                choose_component("NUL.txt", parent, false, &transfer).unwrap(),
+                Some("_NUL.txt".into())
+            );
+            assert_eq!(
+                choose_component("name. ", parent, true, &transfer).unwrap(),
+                Some("name".into())
+            );
+            assert_eq!(
+                choose_component("ordinary.txt", parent, false, &transfer).unwrap(),
+                Some("ordinary.txt".into())
+            );
+            assert_eq!(
+                choose_component("...", parent, false, &transfer).unwrap(),
+                None
+            );
+        });
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let fresh_transfer = Transfer::with_conflicts(sender);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let request = receiver.recv().unwrap();
+                assert_eq!(request.invalid_name.as_deref(), Some("a:b.txt"));
+                request
+                    .reply
+                    .send(ConflictAnswer {
+                        proceed: Some(false),
+                        apply_all: false,
+                        rename: None,
+                        auto_normalize: false,
+                    })
+                    .unwrap();
+            });
+            assert_eq!(
+                choose_component("a:b.txt", parent, false, &fresh_transfer).unwrap(),
+                None
+            );
+        });
+    }
+    #[test]
+    fn auto_normalize_once_prompts_for_the_next_invalid_name() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let transfer = Transfer::with_conflicts(sender);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                for _ in 0..2 {
+                    let request = receiver.recv().unwrap();
+                    request
+                        .reply
+                        .send(ConflictAnswer {
+                            proceed: Some(true),
+                            apply_all: false,
+                            rename: None,
+                            auto_normalize: true,
+                        })
+                        .unwrap();
+                }
+            });
+            let parent = std::path::Path::new("parent");
+            assert_eq!(
+                choose_component("a:b", parent, false, &transfer).unwrap(),
+                Some("a_b".into())
+            );
+            assert_eq!(
+                choose_component("c:d", parent, false, &transfer).unwrap(),
+                Some("c_d".into())
+            );
+        });
     }
     #[test]
     fn folder_export_names_are_single_windows_components() {

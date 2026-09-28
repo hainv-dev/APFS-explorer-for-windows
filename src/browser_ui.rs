@@ -34,6 +34,7 @@ pub struct BrowserPanel {
     conflicts: Option<Receiver<crate::browser::ConflictRequest>>,
     conflict: Option<crate::browser::ConflictRequest>,
     apply_all: bool,
+    replacement_name: String,
     temporary_files: std::sync::Arc<std::sync::Mutex<Vec<tempfile::TempDir>>>,
 }
 
@@ -94,6 +95,12 @@ impl BrowserPanel {
         {
             self.conflict = Some(request);
             self.apply_all = false;
+            self.replacement_name = self
+                .conflict
+                .as_ref()
+                .and_then(|request| request.invalid_name.as_deref())
+                .and_then(|name| crate::browser::windows_component(name).ok())
+                .unwrap_or_default();
         }
         let Some(receiver) = &self.pending else {
             return;
@@ -166,38 +173,81 @@ impl BrowserPanel {
         let Some(request) = &self.conflict else {
             return;
         };
+        let invalid_name = request.invalid_name.is_some();
         let mut decision = None;
+        let mut auto_normalize = false;
         let modal = egui::Modal::new(egui::Id::new("extract_conflict")).show(context, |ui| {
             ui.set_width((context.screen_rect().width() - 64.0).clamp(240.0, 480.0));
-            ui.heading(if request.directory {
+            ui.heading(if invalid_name {
+                "Name cannot be used on Windows"
+            } else if request.directory {
                 "Folder already exists"
             } else {
                 "File already exists"
             });
             ui.add_space(10.0);
-            ui.add(egui::Label::new(request.path.display().to_string()).wrap());
-            ui.add_space(10.0);
-            ui.label(if request.directory {
-                "Merge folders? Conflicting files will be handled separately."
-            } else {
-                "Replace the destination file after the new copy is complete?"
-            });
-            ui.checkbox(
-                &mut self.apply_all,
-                if request.directory {
-                    "Apply to all folder conflicts in this extraction"
-                } else {
-                    "Apply to all file conflicts in this extraction"
-                },
+            ui.add(
+                egui::Label::new(
+                    request
+                        .invalid_name
+                        .as_deref()
+                        .map_or_else(|| request.path.display().to_string(), str::to_owned),
+                )
+                .wrap(),
             );
+            ui.add_space(10.0);
+            if invalid_name {
+                ui.label("Enter a Windows-safe name for this copy, or skip it.");
+                ui.text_edit_singleline(&mut self.replacement_name);
+                if let Err(error) = crate::browser::exact_component(&self.replacement_name) {
+                    ui.colored_label(egui::Color32::from_rgb(170, 40, 40), error);
+                }
+                ui.checkbox(
+                    &mut self.apply_all,
+                    "Apply auto-normalize to all invalid names in this extraction",
+                );
+            } else {
+                ui.label(if request.directory {
+                    "Merge folders? Conflicting files will be handled separately."
+                } else {
+                    "Replace the destination file after the new copy is complete?"
+                });
+                ui.checkbox(
+                    &mut self.apply_all,
+                    if request.directory {
+                        "Apply to all folder conflicts in this extraction"
+                    } else {
+                        "Apply to all file conflicts in this extraction"
+                    },
+                );
+            }
             ui.add_space(12.0);
             ui.horizontal_wrapped(|ui| {
+                if invalid_name
+                    && ui
+                        .add_enabled(
+                            request.invalid_name.as_deref().is_some_and(|name| {
+                                crate::browser::windows_component(name).is_ok()
+                            }),
+                            egui::Button::new("Auto-normalize"),
+                        )
+                        .clicked()
+                {
+                    auto_normalize = true;
+                    decision = Some(Some(true));
+                }
                 if ui
-                    .button(if request.directory {
-                        "Merge"
-                    } else {
-                        "Replace"
-                    })
+                    .add_enabled(
+                        !invalid_name
+                            || crate::browser::exact_component(&self.replacement_name).is_ok(),
+                        egui::Button::new(if invalid_name {
+                            "Use name"
+                        } else if request.directory {
+                            "Merge"
+                        } else {
+                            "Replace"
+                        }),
+                    )
                     .clicked()
                 {
                     decision = Some(Some(true));
@@ -219,6 +269,8 @@ impl BrowserPanel {
             let _ = request.reply.send(crate::browser::ConflictAnswer {
                 proceed,
                 apply_all: self.apply_all,
+                rename: invalid_name.then(|| self.replacement_name.clone()),
+                auto_normalize,
             });
         }
     }
@@ -274,7 +326,7 @@ impl BrowserPanel {
             egui::Frame::NONE
                 .fill(egui::Color32::WHITE)
                 .stroke(egui::Stroke::new(
-                    1.0,
+                    1.0_f32,
                     egui::Color32::from_rgb(218, 224, 232),
                 ))
                 .corner_radius(6)
@@ -412,6 +464,12 @@ impl BrowserPanel {
             use std::sync::atomic::Ordering;
             let completed = transfer.completed.load(Ordering::Relaxed);
             let total = transfer.total.load(Ordering::Relaxed);
+            let remaining = total.saturating_sub(completed);
+            let eta = transfer
+                .started
+                .lock()
+                .unwrap()
+                .and_then(|started| estimate_remaining(completed, total, started.elapsed()));
             ui.horizontal(|ui| {
                 ui.add(
                     egui::ProgressBar::new(if total == 0 {
@@ -440,6 +498,45 @@ impl BrowserPanel {
                     transfer.cancelled.store(true, Ordering::Relaxed);
                 }
             });
+            if total > 0 {
+                ui.label(format!(
+                    "Current file: {} remaining | ETA {}",
+                    format_size(remaining),
+                    eta.map_or_else(|| "calculating...".into(), format_duration)
+                ));
+            }
+            if let Some(started) = *transfer.folder_started.lock().unwrap() {
+                if !transfer.files_counted.load(Ordering::Relaxed) {
+                    ui.label(format!(
+                        "Scanning folder: {} files found | {} handled; total and ETA pending",
+                        transfer.files_total.load(Ordering::Relaxed),
+                        transfer.files_handled.load(Ordering::Relaxed)
+                    ));
+                } else {
+                    let files_total = transfer.files_total.load(Ordering::Relaxed);
+                    let files_handled = transfer.files_handled.load(Ordering::Relaxed);
+                    let files_remaining = files_total.saturating_sub(files_handled);
+                    let folder_eta =
+                        estimate_remaining(files_handled, files_total, started.elapsed());
+                    ui.add(
+                        egui::ProgressBar::new(if files_total == 0 {
+                            1.0
+                        } else {
+                            files_handled as f32 / files_total as f32
+                        })
+                        .desired_width(ui.available_width())
+                        .text(format!("Folder: {files_handled} / {files_total} files")),
+                    );
+                    ui.label(format!(
+                        "{files_remaining} files remaining | Folder ETA {}",
+                        if files_remaining == 0 {
+                            "0s".into()
+                        } else {
+                            folder_eta.map_or_else(|| "calculating...".into(), format_duration)
+                        }
+                    ));
+                }
+            }
             context.request_repaint_after(std::time::Duration::from_millis(100));
         }
         ui.separator();
@@ -762,12 +859,13 @@ impl BrowserPanel {
                         {
                             Some(parent) => reader
                                 .extract_folder(volume, oid, &name, &parent, &transfer)
-                                .map(|path| {
-                                    Outcome::Saved(format!(
+                                .map(|path| match path {
+                                    Some(path) => Outcome::Saved(format!(
                                         "Folder saved: {} | {} skipped",
                                         path.display(),
                                         transfer.skipped.load(std::sync::atomic::Ordering::Relaxed)
-                                    ))
+                                    )),
+                                    None => Outcome::Saved("Folder skipped".into()),
                                 }),
                             None => Ok(Outcome::Saved("Extraction cancelled".into())),
                         };
@@ -859,6 +957,31 @@ fn format_size(bytes: u64) -> String {
         }
     }
     format!("{value:.1} {unit}")
+}
+
+fn estimate_remaining(
+    completed: u64,
+    total: u64,
+    elapsed: std::time::Duration,
+) -> Option<std::time::Duration> {
+    if completed == 0 || total == 0 || elapsed.as_secs_f64() < 1.0 {
+        return None;
+    }
+    let seconds = elapsed.as_secs_f64() * total.saturating_sub(completed) as f64 / completed as f64;
+    Some(std::time::Duration::from_secs_f64(seconds))
+}
+
+fn format_duration(duration: std::time::Duration) -> String {
+    let seconds = duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_nanos() > 0));
+    if seconds >= 3600 {
+        format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
+    } else if seconds >= 60 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn entry_type(entry: &DirEntry) -> String {
@@ -1262,6 +1385,26 @@ mod tests {
         assert_eq!(format_size(1024), "1.0 KiB");
         assert_eq!(format_size(1536), "1.5 KiB");
         assert_eq!(format_size(1_073_741_824), "1.0 GiB");
+    }
+    #[test]
+    fn estimates_current_file_time_remaining() {
+        use std::time::Duration;
+        assert_eq!(estimate_remaining(0, 100, Duration::from_secs(4)), None);
+        assert_eq!(
+            estimate_remaining(50, 100, Duration::from_millis(500)),
+            None
+        );
+        assert_eq!(
+            estimate_remaining(25, 100, Duration::from_secs(2)),
+            Some(Duration::from_secs(6))
+        );
+        assert_eq!(
+            estimate_remaining(100, 100, Duration::from_secs(2)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(format_duration(Duration::from_millis(1500)), "2s");
+        assert_eq!(format_duration(Duration::from_secs(125)), "2m 5s");
+        assert_eq!(format_duration(Duration::from_secs(3661)), "1h 1m");
     }
     #[test]
     fn dates_use_utc_and_unknown_is_explicit() {

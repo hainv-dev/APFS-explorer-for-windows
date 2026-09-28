@@ -22,7 +22,7 @@ Your support helps others discover the project and encourages further developmen
 - [Download v0.1.1 executable](https://github.com/hainv-dev/APFS-explorer-for-windows/releases/download/v0.1.1/apfs_explorer.exe)
 
 1. Download and extract the ZIP to a local folder.
-2. Run `apfs_explorer.exe`. Use **Run as administrator** if physical-disk access is denied.
+2. Run `apfs_explorer.exe` and approve the Windows administrator prompt.
 3. Select **Scan drives**, then **Browse volumes** on a verified APFS partition.
 
 Version 0.1.1 is a **pre-release** and includes the new application icon in the
@@ -45,7 +45,7 @@ SHA256 checksums are included in the release notes.
 ## Requirements
 
 - Windows with Windows PowerShell Storage cmdlets available.
-- Administrator access for physical-disk reads when required by Windows.
+- Administrator access to launch the application (Windows prompts for elevation).
 - A graphics adapter/driver supported by WGPU; the Windows build enables Direct3D 12.
 - Stable Rust and the MSVC build tools for building from source.
 
@@ -63,8 +63,14 @@ Install stable Rust with the MSVC toolchain and Visual Studio Build Tools
 Use current stable Rust (tested with Rust 1.94).
 
 ```powershell
-cargo run
+cargo build
+Start-Process -FilePath (Resolve-Path .\target\debug\apfs_explorer.exe) -Verb RunAs
 ```
+
+Approve the UAC prompt to start the application. `cargo run` from a non-elevated
+terminal cannot launch an executable that requires administrator privileges
+(Windows error 740). Alternatively, run `cargo run` from an already elevated
+terminal.
 
 Use **Open image...** or drop a raw APFS partition image into the window.
 The application opens the image read-only and reads its initial container header.
@@ -76,8 +82,8 @@ The background scanner uses Windows PowerShell Storage cmdlets (`Get-Disk` and
 at each partition offset. No APFS driver is required.
 
 Results distinguish APFS partition types from verified NXSB signatures.
-If access is denied, start the application yourself with **Run as administrator**
-and scan again. The application never requests elevation automatically.
+The Windows executable requests elevation when launched; approve the UAC prompt
+before scanning. Access can still be denied for individual disks.
 Scanning does not mount or modify a physical drive.
 Rescan after connecting or disconnecting a drive; results are a point-in-time snapshot.
 Offline/inaccessible disks may generate warnings. Non-GPT layouts and disks not
@@ -146,12 +152,23 @@ for the current extraction only. Folder and file conflict policies are separate.
 Escape or dismissing the modal cancels extraction; it never approves replacement.
 Replacement occurs only after the new file has been fully copied.
 
-Subdirectories and empty directories are preserved. Files use streaming extraction;
-the byte progress resets for each file. Cancel applies to the entire folder operation.
-Names that cannot be preserved on Windows cause an explicit error; they are not
-silently normalized. Case-insensitive source-name collisions abort the operation.
-Symlinks/special files, compressed
-or encrypted files and directory cycles/depth over 64 are rejected, not skipped.
+Subdirectories and empty directories are preserved. Folder extraction scans on a
+second disk reader and starts copying after about 1,000 files are found (or when
+scanning finishes earlier). Scanning stays within roughly 4,096 discovered files
+of copying unless it must finish counting a skipped subfolder. While scanning continues, the UI shows files found
+and handled; an exact remaining count and folder ETA appear only after scanning
+finishes. Current-file byte progress and its ETA remain visible during copying.
+The byte progress resets for each file; the folder ETA estimates time from files
+handled so far, so file-size differences can change the estimate. Skipped files
+and files in skipped subfolders count as handled. Cancel applies to the entire folder operation.
+Names that cannot be preserved on Windows prompt for a manual replacement,
+Auto-normalize, Skip, or Cancel. Check **Apply auto-normalize to all invalid names**
+before choosing Auto-normalize to use Windows-safe names for later invalid entries
+in this extraction; names are never changed silently. Case-insensitive destination-name
+collisions still abort the operation rather than overwrite a different source file.
+Symlinks and special entries are skipped and included in the skipped count;
+their targets are not followed. Compressed or encrypted files and directory
+cycles/depth over 64 still stop extraction.
 On error/cancel the current incomplete file is removed. Previously copied files
 and created folders remain, including replacements explicitly approved by the user.
 Do not modify the output directory during extraction; forced termination or external
